@@ -1,0 +1,175 @@
+/*
+Copyright (c) 2020 Ujaval Gandhi.
+This work is licensed under the terms of the MIT license.  
+For a copy, see https://opensource.org/licenses/MIT
+*/
+
+// Pre-processing
+// Rename the source bands to more readable names
+var bandNames = ['red', 'green', 'blue']
+var reference = reference.rename(bandNames)
+var target = target.rename(bandNames)
+
+// Define a function to display histogram of a band
+var showHistogram = function(image, name, band) {
+  var options = {
+  title: 'Histogram of ' + name,
+  fontSize: 20,
+  hAxis: {title: 'DN'},
+  vAxis: {title: 'count of DN'},
+  series: {
+    0: {color: band},
+  }};
+    
+  var histogram = ui.Chart.image.histogram({
+  image: image.select(band),
+  region: image.geometry(),
+  maxBuckets: Math.pow(2, 8),
+  scale: 10,
+  })
+  
+  var histogram = histogram.setSeriesNames([band])
+    .setOptions(options);
+  print(histogram)
+}
+// Show histograms
+showHistogram(reference, 'Reference Image', 'red')
+showHistogram(target, 'Target Image', 'red')
+
+  
+Map.addLayer(reference, {min:0, max:255}, 'Reference Image')
+Map.addLayer(target, {min:0, max: 255}, 'Target Image')
+Map.centerObject(target)
+
+// Array basics
+var test1 = ee.Array([0, 1, 2, 3, 4, 5])
+var test2 = ee.Array([1, 1, 1, 1, 1, 1])
+print(test1)
+print(test2)
+print(test1.accum({axis:0})) // [0, 1, 3, 6, 10, 15]
+var test2 = ee.Array([1, 1, 1, 1, 1, 1])
+// Combine along axis 0
+print(ee.Array.cat([test1, test2], 0)) // [0,1,2,3,4,5,1,1,1,1,1,1]
+// Combine along axis 1
+print(ee.Array.cat([test1, test2], 1)) // [[0,1],[1,1],[2,1],[3,1],[4,1],[5,1]]
+
+var getHistData = function(image, band) {
+  var histogram = image.reduceRegion({
+    reducer: ee.Reducer.histogram({
+      maxBuckets: Math.pow(2, 8), 
+    }), 
+    geometry: image.geometry(), 
+    scale: 10, 
+    maxPixels: 1e9, 
+  });
+  // Get the list of DN values (x-axis of the histogram)
+  var dnList = ee.List(ee.Dictionary(histogram.get(band)).get('bucketMeans'));
+  // Get the list of Counts values (y-Axis of the histogram)
+  var countsList = ee.List(ee.Dictionary(histogram.get(band)).get('histogram'));
+  // Compute the cumulative sum of the counts
+  var cumulativeCountsArray = ee.Array(countsList).accum({axis:0});
+  // The last element of the array is the total count, so extract it.
+  var totalCount = cumulativeCountsArray.get([-1]);
+  // Divide each value by the total so that the values are between 0 and 1
+  // This will be the cumulative probability at each DN
+  var cumulativeProbabilities = cumulativeCountsArray.divide(totalCount);
+  
+  // Create a merged array with DN and cumulative probabilities
+  var array = ee.Array.cat({arrays: [dnList, cumulativeProbabilities], axis:1});
+
+  // FeatureCollections give is a lot of flexibility such as charting, classification etc.
+  // Convert the array into a feature collection with null geometries
+  var fc = ee.FeatureCollection(array.toList().map(function(list) {
+    return ee.Feature(null, {
+      dn: ee.List(list).get(0), 
+      probability: ee.List(list).get(1)});
+  }));
+  return fc
+};
+
+// Define a function to display Cumulative Distribution Function (CDF) of a band
+var showCdf = function(image, name, band) {
+  var cdf = getHistData(image, band)
+  
+  var options = {
+    title: 'Cumulative Distribution Function (CDF) of ' + name ,
+    fontSize: 20,
+    hAxis: {title: 'DN'},
+    vAxis: {title: 'Cumulative Probability'},
+    series: {
+      0: {color: band},
+    }
+  }; 
+  
+  var cdfChart = ui.Chart.feature.byFeature({
+    features: cdf,
+    xProperty: 'dn',
+    yProperties: ['probability']
+  }).setOptions(options);
+  print(cdfChart)  
+}
+
+// Show CDFs
+showCdf(reference, 'Reference Image', 'red')
+showCdf(target, 'Target Image', 'red')
+
+
+// Equalize a given band between two images.  
+var equalize = function(referenceImage, targetImage, band) {
+  var referenceHistData = getHistData(referenceImage, band);
+  var targetHistData = getHistData(targetImage, band);
+  
+  // When you build a classifier, the default mode is to output
+  // discrete class numbers. But you can set the mode to 'REGRESSION'
+  // to have the classifier output continuous values from standard regression
+  
+  // We build 2 classifiers to approximate the CDF of each image
+  // Classifier dnToProb will take the a DN value and predict the cumulative probability
+  // Classifier probToDn will take the cumulative probability and predict the DN value
+  // We train dnToProb on target image and probToDn on reference image
+    
+    var dnToProb = ee.Classifier.smileRandomForest(100)
+      .setOutputMode('REGRESSION')
+      .train({
+        features: targetHistData, 
+        classProperty: 'probability', 
+        inputProperties: ['dn']
+    });
+  
+    var probToDn = ee.Classifier.smileRandomForest(100)
+      .setOutputMode('REGRESSION')
+      .train({
+        features: referenceHistData, 
+        classProperty: 'dn', 
+        inputProperties: ['probability']
+    });
+
+    // Now we can take the target image and get cumulative probability
+    var targetImageProb = targetImage.select(band).rename('dn').classify(dnToProb, 'probability')
+    var targetImageDn = targetImageProb.classify(probToDn, band)
+    return targetImageDn
+};
+
+
+var match = function(referenceImage, targetImage, bandNames) {
+  var matchedBands = bandNames.map(function(band) {
+    return equalize(referenceImage, targetImage, band);
+  })
+  return ee.Image.cat(matchedBands)
+};
+
+var matched = match(reference, target, bandNames)
+showHistogram(matched, 'Matched Image', 'red')
+showCdf(matched, 'Matched Image', 'red')
+
+Map.addLayer(matched, {min:0, max:255}, 'Matched Image')
+
+// Export the matched image
+
+Export.image.toDrive({
+  image: matched.visualize({min:0, max:255}),
+  folder: 'earthengine',
+  fileNamePrefix: 'matched',
+  region: matched.geometry(),
+  scale: 0.05,
+  maxPixels: 1e13})
